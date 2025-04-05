@@ -4,26 +4,36 @@ import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from textblob import TextBlob
+import requests
 import re
 import random
 from datetime import datetime
 from resources import enhanced_resources
 
+# Download required NLTK resources
 nltk.download('vader_lexicon')
+nltk.download('punkt')
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
-# Enhanced initialization
+# Initialize NLP tools
 sia = SentimentIntensityAnalyzer()
+vectorizer = TfidfVectorizer()
+tfidf_matrix = vectorizer.fit_transform([item['concern'] for item in enhanced_resources])
+
+# Conversation state
 conversation_context = {
     "last_topics": [],
     "emotional_state": None,
     "follow_up_count": 0,
     "last_response_time": None
 }
-vectorizer = TfidfVectorizer()
-tfidf_matrix = vectorizer.fit_transform([item['concern'] for item in enhanced_resources])
+
+# Pixabay API configuration
+PIXABAY_API_KEY = "49655416-231675e172976ac9757109a3d"
+PIXABAY_API_URL = "https://pixabay.com/api/"
 
 def preprocess_input(text):
     text = re.sub(r'[^\w\s.!?]', '', text.lower())
@@ -31,81 +41,109 @@ def preprocess_input(text):
 
 def detect_concern(user_input):
     processed_input = preprocess_input(user_input)
-    
-    # Check for positive states
-    positive_words = ['happy', 'joy', 'excited', 'proud', 'good', 'great']
-    if any(word in processed_input for word in positive_words):
+
+    if any(word in processed_input for word in ['happy', 'joy', 'excited', 'great']):
         return "positive_state"
-    
-    # Enhanced concern detection
+
     for concern in enhanced_resources:
         if (concern['concern'] in processed_input or 
             any(syn in processed_input for syn in concern['synonyms'])):
             return concern
-    
-    # Semantic similarity fallback
+
     input_vec = vectorizer.transform([processed_input])
     similarity = cosine_similarity(input_vec, tfidf_matrix).flatten()
     if similarity.max() > 0.5:
         return enhanced_resources[similarity.argmax()]
+    
+    return None
+
+def detect_emotion(text):
+    blob_score = TextBlob(text).sentiment.polarity
+    vader_score = sia.polarity_scores(text)['compound']
+    polarity = (blob_score + vader_score) / 2
+
+    if polarity > 0.3:
+        return "happy", min(1.0, polarity * 2)
+    elif polarity < -0.3:
+        return "sad", min(1.0, abs(polarity) * 2)
+    else:
+        return "neutral", 0.5
+
+def get_relevant_gif(emotion):
+    keywords = {
+        "happy": "excited celebration",
+        "sad": "comforting hug",
+        "neutral": "calming nature",
+        "positive_state": "happy dance"
+    }
+    query = keywords.get(emotion, "happy")
+
+    try:
+        response = requests.get(
+            PIXABAY_API_URL,
+            params={
+                'key': PIXABAY_API_KEY,
+                'q': query,
+                'image_type': 'photo',
+                'orientation': 'horizontal',
+                'category': 'people',
+                'safesearch': 'true',
+                'per_page': 5
+            }
+        )
+        images = response.json().get('hits', [])
+        if images:
+            return images[0].get('previewURL')
+    except Exception as e:
+        app.logger.error(f"[Pixabay] Error fetching GIF: {e}")
+    
     return None
 
 def generate_response(user_input):
     global conversation_context
-    
+
     sentiment = sia.polarity_scores(user_input)
     concern = detect_concern(user_input)
     current_time = datetime.now()
-    
-    # Time-based greeting
+
     if not conversation_context["last_response_time"]:
         hour = current_time.hour
         greeting = "Good morning" if 5 <= hour < 12 else "Good afternoon" if 12 <= hour < 17 else "Good evening"
-        return f"{greeting}! I'm here to support you. How are you feeling today?"
-    
-    # Handle positive states
+        return f"{greeting}! I'm here to support you. How are you feeling today?", None
+
     if concern == "positive_state":
         conversation_context.update({
             "emotional_state": "positive",
             "last_topics": ["happiness"],
             "follow_up_count": 0
         })
-        positive_responses = [
-            "That's wonderful to hear! 😊 Would you like to share what's brought you this happiness?",
-            "Your joy brightens my day! 🌟 What specifically contributed to these good feelings?",
-            "Celebrating with you! 🎉 What was the highlight of this positive experience?"
-        ]
-        return random.choice(positive_responses)
-    
-    # Handle identified concerns
+        return random.choice([
+            "That's wonderful to hear! 😊 What brought you this joy?",
+            "Yay! I'd love to know what made your day!",
+            "I'm happy you're happy! 🥳"
+        ]), "happy"
+
     if isinstance(concern, dict):
         response = random.choice(concern['responses'])
-        
-        # Emotional validation
+
         if sentiment['neg'] > 0.6:
-            emotional_support = [
-                "I can see this is weighing heavily on you... 💙",
-                "This sounds genuinely difficult to bear... 🌧️",
-                "My heart goes out to you as you face this... 🤲"
-            ]
-            response = f"{random.choice(emotional_support)}\n\n{response}"
+            response = f"{random.choice(['I’m really sorry you’re going through this 💙', 'That sounds really tough 😔'])}\n\n{response}"
         
-        # Context management
         if concern['concern'] not in conversation_context["last_topics"]:
             conversation_context["last_topics"].append(concern['concern'])
             conversation_context["follow_up_count"] = 1
-            return f"{response}\n\n{concern.get('follow_up', '')}"
+            return f"{response}\n\n{concern.get('follow_up', '')}", "sad"
         else:
             conversation_context["follow_up_count"] += 1
             if conversation_context["follow_up_count"] > 2:
                 conversation_context["last_topics"].pop()
-                return "To better assist you, let's try approaching this differently. Could you describe what ideal support would look like for you right now?"
-            return response
-    
-    # Default fallback with context awareness
+                return "Let's try looking at this from another angle. What kind of support do you feel would help right now?", "neutral"
+            return response, "sad"
+
     if conversation_context["last_topics"]:
-        return "I want to understand this completely. Could you tell me more about how this affects your daily life?"
-    return "Help me understand what's on your mind. What's been most present for you lately?"
+        return "Tell me more about how this is impacting you lately.", "neutral"
+    
+    return "What’s been on your mind recently? I'm here to listen.", "neutral"
 
 @app.route('/')
 def home():
@@ -115,21 +153,36 @@ def home():
 def chat():
     try:
         message = request.json.get('message', '')
-        if not message:
-            return jsonify({"error": "Empty message"}), 400
-        
-        response = generate_response(message)
+        if not message.strip():
+            return jsonify({"error": "Message is empty"}), 400
+
+        response, emotion = generate_response(message)
+        gif_url = get_relevant_gif(emotion) if emotion and random.random() > 0.3 else None
         conversation_context["last_response_time"] = datetime.now()
-        
+
         return jsonify({
             "response": response,
+            "gif_url": gif_url,
             "sentiment": sia.polarity_scores(message)
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/analyze', methods=['POST'])
+def analyze_emotion():
+    try:
+        message = request.json.get('message', '')
+        emotion, confidence = detect_emotion(message)
+        gif_url = get_relevant_gif(emotion) if confidence > 0.6 else None
+
+        return jsonify({
+            "emotion": emotion,
+            "confidence": confidence,
+            "gif_url": gif_url
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
-
-
-
